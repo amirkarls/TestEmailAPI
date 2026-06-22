@@ -46,13 +46,17 @@ async function initDB() {
 
 // ===== РАБОТА С MOEMAIL API =====
 
-// Создать ящик
+// Создать ящик (правильный эндпоинт)
 async function createMailAccount() {
   try {
+    console.log('📡 Создаю ящик через MoeMail API...');
+    
     const response = await axios.post(
-      `${MOEMAIL_API_URL}/accounts`,
+      `${MOEMAIL_API_URL}/emails/generate`,
       {
-        // MoeMail сам генерирует адрес, если не указать
+        name: Math.random().toString(36).substring(2, 10),
+        expiryTime: 3600000, // 1 час
+        domain: 'moemail.app'
       },
       {
         headers: {
@@ -62,21 +66,31 @@ async function createMailAccount() {
       }
     );
     
+    console.log('✅ Ящик создан:', response.data);
     return {
       email: response.data.email,
-      id: response.data.id
+      id: response.data.id || response.data.email
     };
   } catch (err) {
-    console.error('Ошибка создания ящика:', err.response?.data || err.message);
-    throw new Error('Не удалось создать ящик: ' + (err.response?.data?.message || err.message));
+    console.error('❌ Ошибка создания ящика:');
+    console.error('Status:', err.response?.status);
+    console.error('Data:', err.response?.data);
+    
+    if (err.response?.status === 403) {
+      throw new Error('Доступ запрещен (403). Проверь API-ключ.');
+    } else if (err.response?.status === 401) {
+      throw new Error('Неверный API-ключ (401). Проверь MOEMAIL_API_KEY.');
+    } else {
+      throw new Error(`Ошибка: ${err.response?.data?.message || err.message}`);
+    }
   }
 }
 
-// Проверить письма
+// Проверить письма (правильный эндпоинт)
 async function checkMail(email) {
   try {
     const response = await axios.get(
-      `${MOEMAIL_API_URL}/messages/${encodeURIComponent(email)}`,
+      `${MOEMAIL_API_URL}/emails/${encodeURIComponent(email)}`,
       {
         headers: {
           'X-API-Key': MOEMAIL_API_KEY
@@ -119,7 +133,7 @@ async function sendEmail(from, to, subject, text) {
 async function deleteMailAccount(email) {
   try {
     await axios.delete(
-      `${MOEMAIL_API_URL}/accounts/${encodeURIComponent(email)}`,
+      `${MOEMAIL_API_URL}/emails/${encodeURIComponent(email)}`,
       {
         headers: {
           'X-API-Key': MOEMAIL_API_KEY
@@ -158,9 +172,9 @@ async function pollAllAccounts() {
           `📤 От: ${from}\n` +
           `📌 Тема: ${subject}\n` +
           `📝 ${text.substring(0, 200)}${text.length > 200 ? '...' : ''}\n\n` +
-          `✉️ *Чтобы ответить, используй команду:*\n` +
-          `/reply [email] [текст] - например:\n` +
-          `/reply friend@gmail.com Привет! Получил твое письмо.`,
+          `✉️ *Чтобы ответить:*\n` +
+          `/reply [email] [текст]\n` +
+          `Пример: /reply friend@gmail.com Привет!`,
           { parse_mode: 'Markdown' }
         );
       } catch (err) {
@@ -227,7 +241,7 @@ bot.command('create', async (ctx) => {
     await ctx.reply(
       `✅ *Ящик создан!*\n\n` +
       `📫 Адрес: \`${email}\`\n` +
-      `🔑 ID: \`${id}\`\n\n` +
+      `⏰ Живет: 1 час\n\n` +
       `📨 Отправьте письмо на этот адрес, и я пришлю уведомление!\n\n` +
       `✉️ *Чтобы отправить письмо:*\n` +
       `/reply [email] [текст]\n` +
@@ -280,7 +294,7 @@ bot.command('check', async (ctx) => {
   await ctx.reply(reply, { parse_mode: 'Markdown' });
 });
 
-// ===== НОВАЯ КОМАНДА "ОТВЕТИТЬ" =====
+// ===== КОМАНДА "ОТВЕТИТЬ" =====
 bot.command('reply', async (ctx) => {
   const telegram_id = ctx.from.id.toString();
   
@@ -371,18 +385,20 @@ bot.command('help', async (ctx) => {
   await ctx.reply(
     '📖 *Помощь*\n\n' +
     '📌 Команды:\n' +
-    '/create - создать новый ящик\n' +
+    '/create - создать новый ящик (живет 1 час)\n' +
     '/check - проверить письма\n' +
     '/reply [email] [текст] - отправить письмо\n' +
     '/delete - удалить ящик\n' +
     '/info - информация о ящике\n' +
     '/help - помощь\n\n' +
     '✉️ *Как отправить письмо:*\n' +
-    '/reply friend@gmail.com Привет! Как дела?\n\n' +
+    `/reply friend@gmail.com Привет! Как дела?\n\n` +
     '⚡️ *Уведомления:*\n' +
     'Я автоматически проверяю почту каждые 15 секунд и присылаю уведомления о новых письмах!\n\n' +
     '💾 *Хранение:*\n' +
-    'Все ящики хранятся в базе данных SQLite. При перезапуске бота данные НЕ теряются.',
+    'Все ящики хранятся в базе данных SQLite. При перезапуске бота данные НЕ теряются.\n\n' +
+    '🔑 *API Key:*\n' +
+    'Используется MoeMail API с ключом из переменных окружения.',
     { parse_mode: 'Markdown' }
   );
 });
@@ -390,6 +406,15 @@ bot.command('help', async (ctx) => {
 // ===== ЗАПУСК БОТА =====
 async function main() {
   await initDB();
+  
+  // Удаляем старый webhook, чтобы избежать конфликта
+  try {
+    await bot.telegram.deleteWebhook();
+    console.log('✅ Webhook удален');
+  } catch (err) {
+    console.log('⚠️ Не удалось удалить webhook:', err.message);
+  }
+  
   await bot.launch();
   console.log('🤖 Бот запущен! Найди его в Telegram и напиши /start');
   
