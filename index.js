@@ -1,433 +1,302 @@
-const express = require('express');
+const { Telegraf } = require('telegraf');
 const axios = require('axios');
-const cors = require('cors');
+const sqlite3 = require('sqlite3').verbose();
+const { open } = require('sqlite');
 
-const app = express();
-app.use(express.json());
-app.use(cors());
+// ===== НАСТРОЙКИ =====
+const BOT_TOKEN = process.env.BOT_TOKEN;
+if (!BOT_TOKEN) {
+  console.error('❌ Ошибка: BOT_TOKEN не найден в переменных окружения!');
+  console.error('📌 Добавь BOT_TOKEN в Environment Variables на Render');
+  process.exit(1);
+}
 
-// Храним данные в памяти (при перезапуске сбросятся)
-let currentAccount = null;
-let currentToken = null;
+const bot = new Telegraf(BOT_TOKEN);
+let db;
 
-// ============ API ЭНДПОИНТЫ ============
+// ===== ИНИЦИАЛИЗАЦИЯ БД =====
+async function initDB() {
+  db = await open({
+    filename: './mails.db',
+    driver: sqlite3.Database
+  });
 
-// 1. Получить доступные домены
-app.get('/api/domains', async (req, res) => {
-  try {
-    const response = await axios.get('https://api.mail.tm/domains');
-    res.json(response.data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
+  await db.exec(`
+    CREATE TABLE IF NOT EXISTS accounts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      telegram_id TEXT UNIQUE,
+      address TEXT,
+      token TEXT,
+      password TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      last_checked DATETIME
+    )
+  `);
 
-// 2. Создать новый ящик
-app.post('/api/create', async (req, res) => {
-  try {
-    // Получаем первый доступный домен
-    const domains = await axios.get('https://api.mail.tm/domains');
-    const domain = domains.data['hydra:member'][0].domain;
-    
-    // Генерируем случайный адрес
-    const random = Math.random().toString(36).substring(2, 10);
-    const address = `${random}@${domain}`;
-    const password = 'temp123456';
+  console.log('✅ База данных инициализирована');
+}
 
-    // Регистрируем аккаунт
-    await axios.post('https://api.mail.tm/accounts', {
-      address,
-      password
-    });
+// ===== РАБОТА С MAIL.TM =====
+async function createMailAccount() {
+  const domains = await axios.get('https://api.mail.tm/domains');
+  const domain = domains.data['hydra:member'][0].domain;
+  const random = Math.random().toString(36).substring(2, 10);
+  const address = `${random}@${domain}`;
+  const password = Math.random().toString(36).substring(2, 12);
 
-    // Получаем токен
-    const tokenRes = await axios.post('https://api.mail.tm/token', {
-      address,
-      password
-    });
+  await axios.post('https://api.mail.tm/accounts', { address, password });
+  const tokenRes = await axios.post('https://api.mail.tm/token', { address, password });
 
-    currentAccount = { address, password };
-    currentToken = tokenRes.data.token;
+  return { address, token: tokenRes.data.token, password };
+}
 
-    res.json({
-      address,
-      token: currentToken,
-      message: 'Ящик создан! Отправьте письмо и проверьте /api/messages'
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// 3. Получить все письма
-app.get('/api/messages', async (req, res) => {
-  if (!currentToken) {
-    return res.status(401).json({ error: 'Сначала создайте ящик через POST /api/create' });
-  }
-
+async function checkMail(token) {
   try {
     const response = await axios.get('https://api.mail.tm/messages', {
-      headers: { Authorization: `Bearer ${currentToken}` }
+      headers: { Authorization: `Bearer ${token}` }
     });
-    res.json(response.data);
+    return response.data['hydra:member'] || [];
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    return null;
   }
-});
+}
 
-// 4. Получить конкретное письмо по ID
-app.get('/api/message/:id', async (req, res) => {
-  if (!currentToken) {
-    return res.status(401).json({ error: 'Сначала создайте ящик' });
-  }
-
+async function deleteMailAccount(token, address) {
   try {
-    const response = await axios.get(`https://api.mail.tm/messages/${req.params.id}`, {
-      headers: { Authorization: `Bearer ${currentToken}` }
-    });
-    res.json(response.data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// 5. Удалить ящик
-app.delete('/api/delete', async (req, res) => {
-  if (!currentAccount || !currentToken) {
-    return res.status(400).json({ error: 'Нет активного ящика' });
-  }
-
-  try {
-    // Получаем список всех аккаунтов
     const accounts = await axios.get('https://api.mail.tm/accounts', {
-      headers: { Authorization: `Bearer ${currentToken}` }
+      headers: { Authorization: `Bearer ${token}` }
     });
-
-    // Находим ID нашего аккаунта
-    const account = accounts.data['hydra:member'].find(
-      a => a.address === currentAccount.address
-    );
-
+    const account = accounts.data['hydra:member'].find(a => a.address === address);
     if (account) {
       await axios.delete(`https://api.mail.tm/accounts/${account.id}`, {
-        headers: { Authorization: `Bearer ${currentToken}` }
+        headers: { Authorization: `Bearer ${token}` }
       });
     }
-
-    currentAccount = null;
-    currentToken = null;
-    res.json({ message: 'Ящик успешно удален' });
+    return true;
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    return false;
+  }
+}
+
+// ===== ПОЛЛИНГ ПОЧТЫ =====
+let lastMessageIds = {};
+
+async function pollAllAccounts() {
+  const accounts = await db.all('SELECT * FROM accounts');
+  
+  for (const acc of accounts) {
+    const messages = await checkMail(acc.token);
+    if (!messages || messages.length === 0) continue;
+
+    const sentIds = lastMessageIds[acc.telegram_id] || [];
+    const newMessages = messages.filter(m => !sentIds.includes(m.id));
+
+    for (const msg of newMessages) {
+      const from = msg.from?.address || 'Неизвестно';
+      const subject = msg.subject || '(без темы)';
+      const intro = msg.intro || '';
+      
+      try {
+        await bot.telegram.sendMessage(
+          acc.telegram_id,
+          `📩 *Новое письмо!*\n\n` +
+          `📤 От: ${from}\n` +
+          `📌 Тема: ${subject}\n` +
+          `📝 ${intro.substring(0, 200)}${intro.length > 200 ? '...' : ''}\n\n` +
+          `🔍 Чтобы прочитать полностью, нажми /check`,
+          { parse_mode: 'Markdown' }
+        );
+      } catch (err) {
+        console.error(`Ошибка отправки пользователю ${acc.telegram_id}:`, err.message);
+      }
+    }
+
+    const allIds = messages.map(m => m.id);
+    lastMessageIds[acc.telegram_id] = allIds;
+
+    await db.run(
+      'UPDATE accounts SET last_checked = CURRENT_TIMESTAMP WHERE telegram_id = ?',
+      acc.telegram_id
+    );
+  }
+}
+
+setInterval(pollAllAccounts, 15000);
+
+// ===== КОМАНДЫ БОТА =====
+
+bot.start(async (ctx) => {
+  await ctx.reply(
+    '📧 *Temp Mail Bot*\n\n' +
+    'Я создаю одноразовые email-ящики и уведомляю о новых письмах!\n\n' +
+    '📌 *Команды:*\n' +
+    '/create - создать новый ящик\n' +
+    '/check - проверить письма\n' +
+    '/delete - удалить ящик\n' +
+    '/info - информация о ящике\n' +
+    '/help - помощь\n\n' +
+    '⚠️ *Важно:* Ящик сохраняется в БД и не удаляется при перезапуске бота!',
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.command('create', async (ctx) => {
+  const telegram_id = ctx.from.id.toString();
+  
+  const existing = await db.get('SELECT * FROM accounts WHERE telegram_id = ?', telegram_id);
+  if (existing) {
+    await ctx.reply(
+      `⚠️ У вас уже есть ящик: \`${existing.address}\`\n\n` +
+      `Используйте /delete чтобы удалить, или /check чтобы проверить письма`,
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+
+  await ctx.reply('⏳ Создаю ящик...');
+
+  try {
+    const { address, token, password } = await createMailAccount();
+    
+    await db.run(
+      'INSERT INTO accounts (telegram_id, address, token, password) VALUES (?, ?, ?, ?)',
+      telegram_id, address, token, password
+    );
+
+    lastMessageIds[telegram_id] = [];
+
+    await ctx.reply(
+      `✅ *Ящик создан!*\n\n` +
+      `📫 Адрес: \`${address}\`\n` +
+      `🔑 Пароль: \`${password}\` (сохраните!)\n\n` +
+      `📨 Отправьте письмо на этот адрес, и я пришлю уведомление!\n\n` +
+      `⚠️ *Важно:* Ящик сохраняется в базе данных и не удаляется при перезапуске бота.`,
+      { parse_mode: 'Markdown' }
+    );
+
+  } catch (err) {
+    await ctx.reply(`❌ Ошибка: ${err.message}`);
   }
 });
 
-// ============ ВЕБ-ИНТЕРФЕЙС (ГЛАВНАЯ СТРАНИЦА) ============
+bot.command('check', async (ctx) => {
+  const telegram_id = ctx.from.id.toString();
+  
+  const account = await db.get('SELECT * FROM accounts WHERE telegram_id = ?', telegram_id);
+  if (!account) {
+    await ctx.reply('❌ У вас нет ящика! Создайте его через /create');
+    return;
+  }
 
-app.get('/', (req, res) => {
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <meta charset="UTF-8">
-      <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Temp Mail - Одноразовая почта</title>
-      <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body {
-          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
-          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-          min-height: 100vh;
-          display: flex;
-          justify-content: center;
-          align-items: center;
-          padding: 20px;
-        }
-        .container {
-          background: white;
-          max-width: 800px;
-          width: 100%;
-          padding: 40px;
-          border-radius: 20px;
-          box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-        }
-        h1 {
-          font-size: 32px;
-          margin-bottom: 8px;
-          color: #333;
-        }
-        .subtitle {
-          color: #666;
-          margin-bottom: 30px;
-          font-size: 14px;
-        }
-        .btn-group {
-          display: flex;
-          flex-wrap: wrap;
-          gap: 10px;
-          margin-bottom: 20px;
-        }
-        button {
-          padding: 12px 24px;
-          border: none;
-          border-radius: 10px;
-          font-size: 16px;
-          font-weight: 600;
-          cursor: pointer;
-          transition: all 0.2s;
-          flex: 1;
-          min-width: 120px;
-        }
-        button:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.2); }
-        .btn-create { background: #4CAF50; color: white; }
-        .btn-check { background: #2196F3; color: white; }
-        .btn-delete { background: #f44336; color: white; }
-        .btn-clear { background: #ff9800; color: white; }
-        .address-box {
-          background: #f0f4ff;
-          padding: 15px;
-          border-radius: 10px;
-          margin: 15px 0;
-          font-family: monospace;
-          font-size: 18px;
-          word-break: break-all;
-          display: none;
-          border: 2px dashed #667eea;
-        }
-        .address-box.show { display: block; }
-        .address-box strong { color: #667eea; }
-        .status {
-          padding: 10px 15px;
-          border-radius: 8px;
-          margin: 10px 0;
-          display: none;
-          font-size: 14px;
-        }
-        .status.success { background: #d4edda; color: #155724; display: block; }
-        .status.error { background: #f8d7da; color: #721c24; display: block; }
-        .status.info { background: #d1ecf1; color: #0c5460; display: block; }
-        .messages-container {
-          margin-top: 20px;
-          border-top: 2px solid #eee;
-          padding-top: 20px;
-        }
-        .messages-container h3 {
-          margin-bottom: 15px;
-          color: #333;
-          font-size: 18px;
-        }
-        .message-item {
-          background: #f8f9fa;
-          padding: 15px;
-          border-radius: 10px;
-          margin-bottom: 12px;
-          border-left: 4px solid #667eea;
-          cursor: pointer;
-          transition: all 0.2s;
-        }
-        .message-item:hover { background: #e9ecef; }
-        .message-item .from { font-weight: 600; color: #333; font-size: 14px; }
-        .message-item .subject { color: #667eea; font-weight: 500; margin: 5px 0; }
-        .message-item .intro { color: #666; font-size: 13px; }
-        .message-item .date { color: #999; font-size: 12px; float: right; }
-        .message-detail {
-          background: #f8f9fa;
-          padding: 20px;
-          border-radius: 10px;
-          margin-top: 15px;
-          display: none;
-          white-space: pre-wrap;
-          word-wrap: break-word;
-          font-size: 14px;
-          line-height: 1.6;
-          max-height: 400px;
-          overflow-y: auto;
-          border: 1px solid #dee2e6;
-        }
-        .message-detail.show { display: block; }
-        .loading { 
-          text-align: center; 
-          color: #666; 
-          padding: 20px;
-          font-style: italic;
-        }
-        .badge {
-          display: inline-block;
-          background: #667eea;
-          color: white;
-          padding: 2px 10px;
-          border-radius: 20px;
-          font-size: 12px;
-          margin-left: 10px;
-        }
-        @media (max-width: 600px) {
-          .container { padding: 20px; }
-          button { min-width: 100%; }
-          h1 { font-size: 24px; }
-        }
-      </style>
-    </head>
-    <body>
-      <div class="container">
-        <h1>📧 Temp Mail</h1>
-        <div class="subtitle">Одноразовый email-ящик. Письма хранятся на mail.tm до 7 дней.</div>
+  await ctx.reply('⏳ Проверяю почту...');
 
-        <div class="btn-group">
-          <button class="btn-create" onclick="createMail()">📨 Создать ящик</button>
-          <button class="btn-check" onclick="checkMail()">📬 Проверить письма</button>
-          <button class="btn-delete" onclick="deleteMail()">🗑 Удалить ящик</button>
-          <button class="btn-clear" onclick="clearDetail()">🧹 Очистить</button>
-        </div>
+  const messages = await checkMail(account.token);
+  if (!messages) {
+    await ctx.reply('❌ Ошибка при проверке почты. Возможно, токен устарел. Удалите ящик и создайте новый.');
+    return;
+  }
 
-        <div id="status" class="status"></div>
+  if (messages.length === 0) {
+    await ctx.reply('📭 Писем пока нет.');
+    return;
+  }
 
-        <div id="addressBox" class="address-box">
-          📫 Ваш ящик: <strong id="addressDisplay">—</strong>
-        </div>
+  lastMessageIds[telegram_id] = messages.map(m => m.id);
 
-        <div class="messages-container">
-          <h3>📩 Входящие <span id="countBadge" class="badge">0</span></h3>
-          <div id="messagesList">
-            <div class="loading">Нажмите "Создать ящик", затем "Проверить письма"</div>
-          </div>
-          <div id="detailView" class="message-detail"></div>
-        </div>
-      </div>
+  let reply = `📬 *Найдено ${messages.length} писем:*\n\n`;
+  messages.slice(0, 5).forEach((msg, i) => {
+    const from = msg.from?.address || 'Неизвестно';
+    const subject = msg.subject || '(без темы)';
+    reply += `${i + 1}. 📤 ${from}\n   📌 ${subject}\n`;
+  });
 
-      <script>
-        const BASE = window.location.origin;
+  if (messages.length > 5) {
+    reply += `\n...и еще ${messages.length - 5} писем. Нажмите /check позже.`;
+  }
 
-        function showStatus(msg, type = 'info') {
-          const el = document.getElementById('status');
-          el.textContent = msg;
-          el.className = 'status ' + type;
-        }
-
-        function showAddress(addr) {
-          const box = document.getElementById('addressBox');
-          document.getElementById('addressDisplay').textContent = addr || '—';
-          box.classList.toggle('show', !!addr);
-        }
-
-        function renderMessages(data) {
-          const container = document.getElementById('messagesList');
-          const badge = document.getElementById('countBadge');
-          
-          if (!data || !data['hydra:member'] || data['hydra:member'].length === 0) {
-            container.innerHTML = '<div class="loading">📭 Писем пока нет. Отправьте письмо на свой ящик!</div>';
-            badge.textContent = '0';
-            return;
-          }
-
-          const messages = data['hydra:member'];
-          badge.textContent = messages.length;
-          
-          container.innerHTML = messages.map((msg, index) => {
-            const from = msg.from?.address || 'Неизвестно';
-            const subject = msg.subject || '(без темы)';
-            const intro = msg.intro || '';
-            const date = msg.createdAt ? new Date(msg.createdAt).toLocaleString() : '';
-            return \`
-              <div class="message-item" onclick="showDetail(\${index})">
-                <span class="date">\${date}</span>
-                <div class="from">📤 \${from}</div>
-                <div class="subject">📌 \${subject}</div>
-                <div class="intro">\${intro.substring(0, 100)}\${intro.length > 100 ? '...' : ''}</div>
-              </div>
-            \`;
-          }).join('');
-
-          // Сохраняем сообщения для просмотра деталей
-          window._messages = messages;
-        }
-
-        function showDetail(index) {
-          const messages = window._messages || [];
-          const msg = messages[index];
-          if (!msg) return;
-
-          const detail = document.getElementById('detailView');
-          const content = msg.html ? msg.html[0] : (msg.text || 'Нет содержимого');
-          detail.innerHTML = \`
-            <strong>📤 От:</strong> \${msg.from?.address || 'Неизвестно'}<br>
-            <strong>📌 Тема:</strong> \${msg.subject || '(без темы)'}<br>
-            <strong>📅 Дата:</strong> \${msg.createdAt ? new Date(msg.createdAt).toLocaleString() : ''}<br>
-            <hr>
-            <div style="margin-top:10px;">\${content}</div>
-          \`;
-          detail.classList.add('show');
-        }
-
-        function clearDetail() {
-          document.getElementById('detailView').classList.remove('show');
-          document.getElementById('detailView').innerHTML = '';
-        }
-
-        async function createMail() {
-          clearDetail();
-          showStatus('⏳ Создаем ящик...', 'info');
-          try {
-            const res = await fetch(BASE + '/api/create', { method: 'POST' });
-            const data = await res.json();
-            if (data.error) throw new Error(data.error);
-            showAddress(data.address);
-            showStatus('✅ Ящик создан! Отправьте письмо на ' + data.address, 'success');
-            document.getElementById('messagesList').innerHTML = '<div class="loading">Ящик создан. Нажмите "Проверить письма"</div>';
-            document.getElementById('countBadge').textContent = '0';
-          } catch (err) {
-            showStatus('❌ Ошибка: ' + err.message, 'error');
-          }
-        }
-
-        async function checkMail() {
-          clearDetail();
-          showStatus('⏳ Проверяем почту...', 'info');
-          try {
-            const res = await fetch(BASE + '/api/messages');
-            if (res.status === 401) {
-              showStatus('❌ Сначала создайте ящик!', 'error');
-              return;
-            }
-            const data = await res.json();
-            if (data.error) throw new Error(data.error);
-            renderMessages(data);
-            const count = data['hydra:member']?.length || 0;
-            showStatus(\`✅ Найдено \${count} писем\`, 'success');
-          } catch (err) {
-            showStatus('❌ Ошибка: ' + err.message, 'error');
-          }
-        }
-
-        async function deleteMail() {
-          clearDetail();
-          showStatus('⏳ Удаляем ящик...', 'info');
-          try {
-            const res = await fetch(BASE + '/api/delete', { method: 'DELETE' });
-            const data = await res.json();
-            if (data.error) throw new Error(data.error);
-            showAddress(null);
-            document.getElementById('messagesList').innerHTML = '<div class="loading">Ящик удален</div>';
-            document.getElementById('countBadge').textContent = '0';
-            showStatus('✅ Ящик удален', 'success');
-          } catch (err) {
-            showStatus('❌ Ошибка: ' + err.message, 'error');
-          }
-        }
-      </script>
-    </body>
-    </html>
-  `);
+  await ctx.reply(reply, { parse_mode: 'Markdown' });
 });
 
-// ============ ЗАПУСК СЕРВЕРА ============
+bot.command('delete', async (ctx) => {
+  const telegram_id = ctx.from.id.toString();
+  
+  const account = await db.get('SELECT * FROM accounts WHERE telegram_id = ?', telegram_id);
+  if (!account) {
+    await ctx.reply('❌ У вас нет ящика.');
+    return;
+  }
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 Temp Mail сервер запущен на порту ${PORT}`);
-  console.log(`📧 Откройте https://localhost:${PORT} или ваш Render URL`);
-  console.log(`📋 API эндпоинты:`);
-  console.log(`   POST /api/create     - создать ящик`);
-  console.log(`   GET  /api/messages   - все письма`);
-  console.log(`   GET  /api/message/:id - письмо по ID`);
-  console.log(`   DELETE /api/delete   - удалить ящик`);
+  await ctx.reply('⏳ Удаляю ящик...');
+
+  const success = await deleteMailAccount(account.token, account.address);
+  if (success) {
+    await db.run('DELETE FROM accounts WHERE telegram_id = ?', telegram_id);
+    delete lastMessageIds[telegram_id];
+    await ctx.reply('✅ Ящик удален. Все данные стерты.');
+  } else {
+    await ctx.reply('⚠️ Не удалось удалить ящик на сервере, но я удалю его из базы данных.');
+    await db.run('DELETE FROM accounts WHERE telegram_id = ?', telegram_id);
+    delete lastMessageIds[telegram_id];
+    await ctx.reply('✅ Ящик удален из базы данных.');
+  }
+});
+
+bot.command('info', async (ctx) => {
+  const telegram_id = ctx.from.id.toString();
+  
+  const account = await db.get('SELECT * FROM accounts WHERE telegram_id = ?', telegram_id);
+  if (!account) {
+    await ctx.reply('❌ У вас нет ящика. Создайте его через /create');
+    return;
+  }
+
+  await ctx.reply(
+    `📫 *Ваш ящик:* \`${account.address}\`\n` +
+    `📅 Создан: ${account.created_at}\n` +
+    `🔄 Последняя проверка: ${account.last_checked || 'никогда'}\n\n` +
+    `⚠️ Ящик хранится в базе данных и НЕ удаляется при перезапуске бота.`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+bot.command('help', async (ctx) => {
+  await ctx.reply(
+    '📖 *Помощь*\n\n' +
+    '📌 Команды:\n' +
+    '/create - создать новый ящик\n' +
+    '/check - проверить письма\n' +
+    '/delete - удалить ящик\n' +
+    '/info - информация о ящике\n' +
+    '/help - помощь\n\n' +
+    '⚡️ *Уведомления:*\n' +
+    'Я автоматически проверяю почту каждые 15 секунд и присылаю уведомления о новых письмах!\n\n' +
+    '💾 *Хранение:*\n' +
+    'Все ящики хранятся в базе данных SQLite. При перезапуске бота данные НЕ теряются.',
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// ===== ЗАПУСК =====
+async function main() {
+  await initDB();
+  await bot.launch();
+  console.log('🤖 Бот запущен! Найди его в Telegram и напиши /start');
+  
+  const accounts = await db.all('SELECT * FROM accounts');
+  for (const acc of accounts) {
+    const messages = await checkMail(acc.token);
+    if (messages) {
+      lastMessageIds[acc.telegram_id] = messages.map(m => m.id);
+    } else {
+      lastMessageIds[acc.telegram_id] = [];
+    }
+  }
+  console.log(`✅ Загружено ${accounts.length} ящиков`);
+}
+
+main();
+
+process.on('SIGINT', () => {
+  console.log('👋 Бот остановлен');
+  process.exit(0);
 });
