@@ -1,7 +1,7 @@
 {
   "name": "temp-mail-bot",
   "version": "1.0.0",
-  "description": "Telegram бот для одноразовой почты",
+  "description": "Telegram бот для одноразовой почты с ответами через браузер",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
