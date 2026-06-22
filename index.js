@@ -96,7 +96,6 @@ async function pollAllAccounts() {
       const from = msg.from?.address || 'Неизвестно';
       const subject = msg.subject || '(без темы)';
       const intro = msg.intro || '';
-      const messageId = msg.id;
       
       try {
         await bot.telegram.sendMessage(
@@ -105,9 +104,10 @@ async function pollAllAccounts() {
           `📤 От: ${from}\n` +
           `📌 Тема: ${subject}\n` +
           `📝 ${intro.substring(0, 200)}${intro.length > 200 ? '...' : ''}\n\n` +
-          `🔗 *Чтобы ответить, перейди по ссылке:*\n` +
-          `https://mail.tm/messages/${messageId}\n\n` +
-          `💡 Откроется веб-версия Mail.tm, там можно написать ответ прямо с твоего ящика!`,
+          `✉️ *Чтобы ответить, используй одну из команд:*\n` +
+          `/web - открыть почту в браузере\n` +
+          `/login - показать логин/пароль\n` +
+          `/replyto - скопировать адрес отправителя`,
           { parse_mode: 'Markdown' }
         );
       } catch (err) {
@@ -137,14 +137,16 @@ bot.start(async (ctx) => {
     '📌 *Команды:*\n' +
     '/create - создать новый ящик\n' +
     '/check - проверить письма\n' +
-    '/read - показать последнее письмо и ссылку для ответа\n' +
+    '/web - открыть почту в браузере (авто-вход)\n' +
+    '/login - показать логин/пароль для входа\n' +
+    '/replyto - показать адрес отправителя для ответа\n' +
     '/delete - удалить ящик\n' +
     '/info - информация о ящике\n' +
     '/help - помощь\n\n' +
     '✉️ *Как ответить на письмо?*\n' +
-    '1. Напиши /read\n' +
-    '2. Бот покажет ссылку на письмо\n' +
-    '3. Перейди по ссылке и ответь в браузере\n\n' +
+    'Вариант 1: /web → открыть почту в браузере → ответить\n' +
+    'Вариант 2: /replyto → скопировать email → отправить с любого ящика\n' +
+    'Вариант 3: /login → войти в Mail.tm через браузер\n\n' +
     '⚠️ *Важно:* Ящик сохраняется в БД и не удаляется при перезапуске бота!',
     { parse_mode: 'Markdown' }
   );
@@ -180,6 +182,9 @@ bot.command('create', async (ctx) => {
       `📫 Адрес: \`${address}\`\n` +
       `🔑 Пароль: \`${password}\` (сохраните!)\n\n` +
       `📨 Отправьте письмо на этот адрес, и я пришлю уведомление!\n\n` +
+      `✉️ *Чтобы ответить на письмо:*\n` +
+      `/web - открыть почту в браузере\n` +
+      `/login - показать логин/пароль\n\n` +
       `⚠️ *Важно:* Ящик сохраняется в базе данных и не удаляется при перезапуске бота.`,
       { parse_mode: 'Markdown' }
     );
@@ -224,40 +229,84 @@ bot.command('check', async (ctx) => {
     reply += `\n...и еще ${messages.length - 5} писем. Нажмите /check позже.`;
   }
 
+  reply += `\n\n✉️ *Чтобы ответить:*\n/web - открыть почту в браузере\n/replyto - скопировать адрес отправителя`;
+
   await ctx.reply(reply, { parse_mode: 'Markdown' });
 });
 
-// ===== НОВАЯ КОМАНДА "ПРОЧИТАТЬ И ОТВЕТИТЬ" =====
-bot.command('read', async (ctx) => {
+// ===== НОВАЯ КОМАНДА "ОТКРЫТЬ ПОЧТУ В БРАУЗЕРЕ" =====
+bot.command('web', async (ctx) => {
   const telegram_id = ctx.from.id.toString();
   
-  // Проверяем, есть ли ящик
   const account = await db.get('SELECT * FROM accounts WHERE telegram_id = ?', telegram_id);
   if (!account) {
     await ctx.reply('❌ У вас нет ящика! Создайте его через /create');
     return;
   }
 
-  // Проверяем почту
+  const webUrl = `https://mail.tm/#/?token=${account.token}`;
+
+  await ctx.reply(
+    `🌐 *Веб-версия Mail.tm*\n\n` +
+    `📫 Ваш ящик: \`${account.address}\`\n\n` +
+    `🔗 *Перейди по ссылке для авто-входа:*\n` +
+    `${webUrl}\n\n` +
+    `💡 Если не открывается, используй команду /login для входа с паролем.`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// ===== НОВАЯ КОМАНДА "ПОКАЗАТЬ ЛОГИН/ПАРОЛЬ" =====
+bot.command('login', async (ctx) => {
+  const telegram_id = ctx.from.id.toString();
+  
+  const account = await db.get('SELECT * FROM accounts WHERE telegram_id = ?', telegram_id);
+  if (!account) {
+    await ctx.reply('❌ У вас нет ящика! Создайте его через /create');
+    return;
+  }
+
+  await ctx.reply(
+    `🔐 *Данные для входа в Mail.tm*\n\n` +
+    `🔗 Ссылка: https://mail.tm\n` +
+    `📫 Адрес: \`${account.address}\`\n` +
+    `🔑 Пароль: \`${account.password}\`\n\n` +
+    `💡 Используй эти данные для входа в веб-версию, чтобы ответить на письма.`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
+// ===== НОВАЯ КОМАНДА "ПОКАЗАТЬ АДРЕС ОТПРАВИТЕЛЯ" =====
+bot.command('replyto', async (ctx) => {
+  const telegram_id = ctx.from.id.toString();
+  
+  const account = await db.get('SELECT * FROM accounts WHERE telegram_id = ?', telegram_id);
+  if (!account) {
+    await ctx.reply('❌ У вас нет ящика! Создайте его через /create');
+    return;
+  }
+
   const messages = await checkMail(account.token);
   if (!messages || messages.length === 0) {
     await ctx.reply('📭 Писем пока нет.');
     return;
   }
 
-  // Берем последнее письмо
   const lastMsg = messages[0];
   const from = lastMsg.from?.address || 'Неизвестно';
   const subject = lastMsg.subject || '(без темы)';
-  const messageId = lastMsg.id;
 
   await ctx.reply(
-    `📩 *Последнее письмо:*\n\n` +
-    `📤 От: ${from}\n` +
+    `✉️ *Чтобы ответить на письмо:*\n\n` +
+    `📤 Кому: \`${from}\`\n` +
     `📌 Тема: ${subject}\n\n` +
-    `🔗 *Чтобы ответить, перейди по ссылке:*\n` +
-    `https://mail.tm/messages/${messageId}\n\n` +
-    `💡 Откроется веб-версия Mail.tm, там можно написать ответ прямо с твоего ящика!`,
+    `📝 *Инструкция:*\n` +
+    `1. Скопируй адрес \`${from}\`\n` +
+    `2. Открой любой почтовый клиент (Gmail, Яндекс, Mail.ru)\n` +
+    `3. Создай новое письмо и вставь адрес\n` +
+    `4. В теме напиши \`Re: ${subject}\`\n` +
+    `5. Отправь ответ\n\n` +
+    `💡 Так письмо уйдет с твоего личного ящика, а не с временного.`,
     { parse_mode: 'Markdown' }
   );
 });
@@ -299,6 +348,9 @@ bot.command('info', async (ctx) => {
     `📫 *Ваш ящик:* \`${account.address}\`\n` +
     `📅 Создан: ${account.created_at}\n` +
     `🔄 Последняя проверка: ${account.last_checked || 'никогда'}\n\n` +
+    `✉️ *Чтобы ответить:*\n` +
+    `/web - открыть почту в браузере\n` +
+    `/login - показать логин/пароль\n\n` +
     `⚠️ Ящик хранится в базе данных и НЕ удаляется при перезапуске бота.`,
     { parse_mode: 'Markdown' }
   );
@@ -310,14 +362,16 @@ bot.command('help', async (ctx) => {
     '📌 Команды:\n' +
     '/create - создать новый ящик\n' +
     '/check - проверить письма\n' +
-    '/read - показать последнее письмо и ссылку для ответа\n' +
+    '/web - открыть почту в браузере (авто-вход)\n' +
+    '/login - показать логин/пароль для входа\n' +
+    '/replyto - показать адрес отправителя для ответа\n' +
     '/delete - удалить ящик\n' +
     '/info - информация о ящике\n' +
     '/help - помощь\n\n' +
-    '✉️ *Как ответить на письмо?*\n' +
-    '1. Напиши /read\n' +
-    '2. Бот покажет ссылку на письмо\n' +
-    '3. Перейди по ссылке и ответь в браузере\n\n' +
+    '✉️ *Как ответить на письмо? (3 способа)*\n' +
+    '1️⃣ /web → открыть почту в браузере → ответить\n' +
+    '2️⃣ /replyto → скопировать email → отправить с любого ящика\n' +
+    '3️⃣ /login → войти в Mail.tm через браузер с паролем\n\n' +
     '⚡️ *Уведомления:*\n' +
     'Я автоматически проверяю почту каждые 15 секунд и присылаю уведомления о новых письмах!\n\n' +
     '💾 *Хранение:*\n' +
@@ -347,7 +401,6 @@ async function main() {
 main();
 
 // ===== ЗАГЛУШКА ДЛЯ RENDER WEB SERVICE =====
-// Это нужно, чтобы Render не падал с ошибкой "No open ports detected"
 const app = express();
 const PORT = process.env.PORT || 10000;
 
@@ -363,7 +416,6 @@ const server = app.listen(PORT, () => {
   console.log(`✅ Web-заглушка слушает порт ${PORT}`);
 });
 
-// Обработка сигналов для корректного завершения
 process.on('SIGTERM', () => {
   console.log('🛑 Получен SIGTERM, закрываю сервер...');
   server.close(() => {
