@@ -2,6 +2,7 @@ const { Telegraf } = require('telegraf');
 const axios = require('axios');
 const sqlite3 = require('sqlite3').verbose();
 const { open } = require('sqlite');
+const express = require('express');
 
 // ===== НАСТРОЙКИ =====
 const BOT_TOKEN = process.env.BOT_TOKEN;
@@ -276,7 +277,7 @@ bot.command('help', async (ctx) => {
   );
 });
 
-// ===== ЗАПУСК =====
+// ===== ЗАПУСК БОТА =====
 async function main() {
   await initDB();
   await bot.launch();
@@ -295,6 +296,32 @@ async function main() {
 }
 
 main();
+
+// ===== ЗАГЛУШКА ДЛЯ RENDER WEB SERVICE =====
+// Это нужно, чтобы Render не падал с ошибкой "No open ports detected"
+const app = express();
+const PORT = process.env.PORT || 10000;
+
+app.get('/', (req, res) => {
+  res.send('🤖 Temp Mail Bot работает!');
+});
+
+app.get('/health', (req, res) => {
+  res.status(200).send('OK');
+});
+
+const server = app.listen(PORT, () => {
+  console.log(`✅ Web-заглушка слушает порт ${PORT}`);
+});
+
+// Обработка сигналов для корректного завершения
+process.on('SIGTERM', () => {
+  console.log('🛑 Получен SIGTERM, закрываю сервер...');
+  server.close(() => {
+    console.log('✅ Сервер закрыт');
+    process.exit(0);
+  });
+});
 
 process.on('SIGINT', () => {
   console.log('👋 Бот остановлен');
