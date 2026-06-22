@@ -1,7 +1,7 @@
 {
-  "name": "temp-mail-bot",
+  "name": "moemail-bot",
   "version": "1.0.0",
-  "description": "Telegram бот для одноразовой почты с ответами через браузер",
+  "description": "Telegram бот для MoeMail с отправкой писем",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
