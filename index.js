@@ -6,9 +6,18 @@ const express = require('express');
 
 // ===== НАСТРОЙКИ =====
 const BOT_TOKEN = process.env.BOT_TOKEN;
+const MOEMAIL_API_KEY = process.env.MOEMAIL_API_KEY;
+const MOEMAIL_API_URL = process.env.MOEMAIL_API_URL || 'https://moemail.app/api';
+
 if (!BOT_TOKEN) {
   console.error('❌ Ошибка: BOT_TOKEN не найден в переменных окружения!');
   console.error('📌 Добавь BOT_TOKEN в Environment Variables на Render');
+  process.exit(1);
+}
+
+if (!MOEMAIL_API_KEY) {
+  console.error('❌ Ошибка: MOEMAIL_API_KEY не найден в переменных окружения!');
+  console.error('📌 Добавь MOEMAIL_API_KEY в Environment Variables на Render');
   process.exit(1);
 }
 
@@ -26,9 +35,7 @@ async function initDB() {
     CREATE TABLE IF NOT EXISTS accounts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       telegram_id TEXT UNIQUE,
-      address TEXT,
-      token TEXT,
-      password TEXT,
+      email TEXT,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       last_checked DATETIME
     )
@@ -37,44 +44,91 @@ async function initDB() {
   console.log('✅ База данных инициализирована');
 }
 
-// ===== РАБОТА С MAIL.TM =====
+// ===== РАБОТА С MOEMAIL API =====
+
+// Создать ящик
 async function createMailAccount() {
-  const domains = await axios.get('https://api.mail.tm/domains');
-  const domain = domains.data['hydra:member'][0].domain;
-  const random = Math.random().toString(36).substring(2, 10);
-  const address = `${random}@${domain}`;
-  const password = Math.random().toString(36).substring(2, 12);
-
-  await axios.post('https://api.mail.tm/accounts', { address, password });
-  const tokenRes = await axios.post('https://api.mail.tm/token', { address, password });
-
-  return { address, token: tokenRes.data.token, password };
+  try {
+    const response = await axios.post(
+      `${MOEMAIL_API_URL}/accounts`,
+      {
+        // MoeMail сам генерирует адрес, если не указать
+      },
+      {
+        headers: {
+          'X-API-Key': MOEMAIL_API_KEY,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    
+    return {
+      email: response.data.email,
+      id: response.data.id
+    };
+  } catch (err) {
+    console.error('Ошибка создания ящика:', err.response?.data || err.message);
+    throw new Error('Не удалось создать ящик: ' + (err.response?.data?.message || err.message));
+  }
 }
 
-async function checkMail(token) {
+// Проверить письма
+async function checkMail(email) {
   try {
-    const response = await axios.get('https://api.mail.tm/messages', {
-      headers: { Authorization: `Bearer ${token}` }
-    });
-    return response.data['hydra:member'] || [];
+    const response = await axios.get(
+      `${MOEMAIL_API_URL}/messages/${encodeURIComponent(email)}`,
+      {
+        headers: {
+          'X-API-Key': MOEMAIL_API_KEY
+        }
+      }
+    );
+    return response.data.messages || [];
   } catch (err) {
+    console.error('Ошибка проверки почты:', err.response?.data || err.message);
     return null;
   }
 }
 
-async function deleteMailAccount(token, address) {
+// Отправить письмо
+async function sendEmail(from, to, subject, text) {
   try {
-    const accounts = await axios.get('https://api.mail.tm/accounts', {
-      headers: { Authorization: `Bearer ${token}` }
-    });
-    const account = accounts.data['hydra:member'].find(a => a.address === address);
-    if (account) {
-      await axios.delete(`https://api.mail.tm/accounts/${account.id}`, {
-        headers: { Authorization: `Bearer ${token}` }
-      });
-    }
+    const response = await axios.post(
+      `${MOEMAIL_API_URL}/send`,
+      {
+        from: from,
+        to: to,
+        subject: subject,
+        text: text
+      },
+      {
+        headers: {
+          'X-API-Key': MOEMAIL_API_KEY,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+    return response.data;
+  } catch (err) {
+    console.error('Ошибка отправки:', err.response?.data || err.message);
+    throw new Error('Не удалось отправить письмо: ' + (err.response?.data?.message || err.message));
+  }
+}
+
+// Удалить ящик
+async function deleteMailAccount(email) {
+  try {
+    await axios.delete(
+      `${MOEMAIL_API_URL}/accounts/${encodeURIComponent(email)}`,
+      {
+        headers: {
+          'X-API-Key': MOEMAIL_API_KEY
+        }
+      }
+    );
     return true;
   } catch (err) {
+    console.error('Ошибка удаления ящика:', err.response?.data || err.message);
     return false;
   }
 }
@@ -86,16 +140,16 @@ async function pollAllAccounts() {
   const accounts = await db.all('SELECT * FROM accounts');
   
   for (const acc of accounts) {
-    const messages = await checkMail(acc.token);
+    const messages = await checkMail(acc.email);
     if (!messages || messages.length === 0) continue;
 
     const sentIds = lastMessageIds[acc.telegram_id] || [];
     const newMessages = messages.filter(m => !sentIds.includes(m.id));
 
     for (const msg of newMessages) {
-      const from = msg.from?.address || 'Неизвестно';
+      const from = msg.from || 'Неизвестно';
       const subject = msg.subject || '(без темы)';
-      const intro = msg.intro || '';
+      const text = msg.text || '';
       
       try {
         await bot.telegram.sendMessage(
@@ -103,11 +157,10 @@ async function pollAllAccounts() {
           `📩 *Новое письмо!*\n\n` +
           `📤 От: ${from}\n` +
           `📌 Тема: ${subject}\n` +
-          `📝 ${intro.substring(0, 200)}${intro.length > 200 ? '...' : ''}\n\n` +
-          `✉️ *Чтобы ответить, используй одну из команд:*\n` +
-          `/web - открыть почту в браузере\n` +
-          `/login - показать логин/пароль\n` +
-          `/replyto - скопировать адрес отправителя`,
+          `📝 ${text.substring(0, 200)}${text.length > 200 ? '...' : ''}\n\n` +
+          `✉️ *Чтобы ответить, используй команду:*\n` +
+          `/reply [email] [текст] - например:\n` +
+          `/reply friend@gmail.com Привет! Получил твое письмо.`,
           { parse_mode: 'Markdown' }
         );
       } catch (err) {
@@ -132,22 +185,16 @@ setInterval(pollAllAccounts, 15000);
 
 bot.start(async (ctx) => {
   await ctx.reply(
-    '📧 *Temp Mail Bot*\n\n' +
-    'Я создаю одноразовые email-ящики и уведомляю о новых письмах!\n\n' +
+    '📧 *MoeMail Bot*\n\n' +
+    'Я создаю временные email-ящики через MoeMail и умею отправлять письма!\n\n' +
     '📌 *Команды:*\n' +
     '/create - создать новый ящик\n' +
     '/check - проверить письма\n' +
-    '/web - открыть почту в браузере (авто-вход)\n' +
-    '/login - показать логин/пароль для входа\n' +
-    '/replyto - показать адрес отправителя для ответа\n' +
+    '/reply [email] [текст] - ответить на письмо\n' +
     '/delete - удалить ящик\n' +
     '/info - информация о ящике\n' +
     '/help - помощь\n\n' +
-    '✉️ *Как ответить на письмо?*\n' +
-    'Вариант 1: /web → открыть почту в браузере → ответить\n' +
-    'Вариант 2: /replyto → скопировать email → отправить с любого ящика\n' +
-    'Вариант 3: /login → войти в Mail.tm через браузер\n\n' +
-    '⚠️ *Важно:* Ящик сохраняется в БД и не удаляется при перезапуске бота!',
+    '⚠️ *Важно:* Все данные сохраняются в БД и не удаляются при перезапуске!',
     { parse_mode: 'Markdown' }
   );
 });
@@ -158,34 +205,33 @@ bot.command('create', async (ctx) => {
   const existing = await db.get('SELECT * FROM accounts WHERE telegram_id = ?', telegram_id);
   if (existing) {
     await ctx.reply(
-      `⚠️ У вас уже есть ящик: \`${existing.address}\`\n\n` +
+      `⚠️ У вас уже есть ящик: \`${existing.email}\`\n\n` +
       `Используйте /delete чтобы удалить, или /check чтобы проверить письма`,
       { parse_mode: 'Markdown' }
     );
     return;
   }
 
-  await ctx.reply('⏳ Создаю ящик...');
+  await ctx.reply('⏳ Создаю ящик через MoeMail...');
 
   try {
-    const { address, token, password } = await createMailAccount();
+    const { email, id } = await createMailAccount();
     
     await db.run(
-      'INSERT INTO accounts (telegram_id, address, token, password) VALUES (?, ?, ?, ?)',
-      telegram_id, address, token, password
+      'INSERT INTO accounts (telegram_id, email) VALUES (?, ?)',
+      telegram_id, email
     );
 
     lastMessageIds[telegram_id] = [];
 
     await ctx.reply(
       `✅ *Ящик создан!*\n\n` +
-      `📫 Адрес: \`${address}\`\n` +
-      `🔑 Пароль: \`${password}\` (сохраните!)\n\n` +
+      `📫 Адрес: \`${email}\`\n` +
+      `🔑 ID: \`${id}\`\n\n` +
       `📨 Отправьте письмо на этот адрес, и я пришлю уведомление!\n\n` +
-      `✉️ *Чтобы ответить на письмо:*\n` +
-      `/web - открыть почту в браузере\n` +
-      `/login - показать логин/пароль\n\n` +
-      `⚠️ *Важно:* Ящик сохраняется в базе данных и не удаляется при перезапуске бота.`,
+      `✉️ *Чтобы отправить письмо:*\n` +
+      `/reply [email] [текст]\n` +
+      `Пример: /reply friend@gmail.com Привет! Как дела?`,
       { parse_mode: 'Markdown' }
     );
 
@@ -205,9 +251,9 @@ bot.command('check', async (ctx) => {
 
   await ctx.reply('⏳ Проверяю почту...');
 
-  const messages = await checkMail(account.token);
+  const messages = await checkMail(account.email);
   if (!messages) {
-    await ctx.reply('❌ Ошибка при проверке почты. Возможно, токен устарел. Удалите ящик и создайте новый.');
+    await ctx.reply('❌ Ошибка при проверке почты. Попробуйте позже.');
     return;
   }
 
@@ -220,7 +266,7 @@ bot.command('check', async (ctx) => {
 
   let reply = `📬 *Найдено ${messages.length} писем:*\n\n`;
   messages.slice(0, 5).forEach((msg, i) => {
-    const from = msg.from?.address || 'Неизвестно';
+    const from = msg.from || 'Неизвестно';
     const subject = msg.subject || '(без темы)';
     reply += `${i + 1}. 📤 ${from}\n   📌 ${subject}\n`;
   });
@@ -229,13 +275,13 @@ bot.command('check', async (ctx) => {
     reply += `\n...и еще ${messages.length - 5} писем. Нажмите /check позже.`;
   }
 
-  reply += `\n\n✉️ *Чтобы ответить:*\n/web - открыть почту в браузере\n/replyto - скопировать адрес отправителя`;
+  reply += `\n\n✉️ *Чтобы ответить:*\n/reply [email] [текст]`;
 
   await ctx.reply(reply, { parse_mode: 'Markdown' });
 });
 
-// ===== НОВАЯ КОМАНДА "ОТКРЫТЬ ПОЧТУ В БРАУЗЕРЕ" =====
-bot.command('web', async (ctx) => {
+// ===== НОВАЯ КОМАНДА "ОТВЕТИТЬ" =====
+bot.command('reply', async (ctx) => {
   const telegram_id = ctx.from.id.toString();
   
   const account = await db.get('SELECT * FROM accounts WHERE telegram_id = ?', telegram_id);
@@ -244,71 +290,38 @@ bot.command('web', async (ctx) => {
     return;
   }
 
-  const webUrl = `https://mail.tm/#/?token=${account.token}`;
-
-  await ctx.reply(
-    `🌐 *Веб-версия Mail.tm*\n\n` +
-    `📫 Ваш ящик: \`${account.address}\`\n\n` +
-    `🔗 *Перейди по ссылке для авто-входа:*\n` +
-    `${webUrl}\n\n` +
-    `💡 Если не открывается, используй команду /login для входа с паролем.`,
-    { parse_mode: 'Markdown' }
-  );
-});
-
-// ===== НОВАЯ КОМАНДА "ПОКАЗАТЬ ЛОГИН/ПАРОЛЬ" =====
-bot.command('login', async (ctx) => {
-  const telegram_id = ctx.from.id.toString();
-  
-  const account = await db.get('SELECT * FROM accounts WHERE telegram_id = ?', telegram_id);
-  if (!account) {
-    await ctx.reply('❌ У вас нет ящика! Создайте его через /create');
+  const args = ctx.message.text.split(' ').slice(1);
+  if (args.length < 2) {
+    await ctx.reply(
+      '❌ *Формат:* `/reply [email] [текст]`\n\n' +
+      '📌 *Примеры:*\n' +
+      '/reply friend@gmail.com Привет! Получил твое письмо.\n' +
+      '/reply user@yandex.ru Спасибо за информацию!',
+      { parse_mode: 'Markdown' }
+    );
     return;
   }
 
-  await ctx.reply(
-    `🔐 *Данные для входа в Mail.tm*\n\n` +
-    `🔗 Ссылка: https://mail.tm\n` +
-    `📫 Адрес: \`${account.address}\`\n` +
-    `🔑 Пароль: \`${account.password}\`\n\n` +
-    `💡 Используй эти данные для входа в веб-версию, чтобы ответить на письма.`,
-    { parse_mode: 'Markdown' }
-  );
-});
+  const to = args[0];
+  const text = args.slice(1).join(' ');
+  const subject = `Re: Письмо от ${to}`;
 
-// ===== НОВАЯ КОМАНДА "ПОКАЗАТЬ АДРЕС ОТПРАВИТЕЛЯ" =====
-bot.command('replyto', async (ctx) => {
-  const telegram_id = ctx.from.id.toString();
-  
-  const account = await db.get('SELECT * FROM accounts WHERE telegram_id = ?', telegram_id);
-  if (!account) {
-    await ctx.reply('❌ У вас нет ящика! Создайте его через /create');
-    return;
+  try {
+    await ctx.reply('⏳ Отправляю письмо через MoeMail...');
+    
+    const result = await sendEmail(account.email, to, subject, text);
+    
+    await ctx.reply(
+      `✅ *Письмо отправлено!*\n\n` +
+      `📤 Кому: ${to}\n` +
+      `📌 Тема: ${subject}\n` +
+      `📝 Текст: ${text}\n\n` +
+      `📨 ID: ${result.id || 'неизвестен'}`,
+      { parse_mode: 'Markdown' }
+    );
+  } catch (err) {
+    await ctx.reply(`❌ Ошибка отправки: ${err.message}`);
   }
-
-  const messages = await checkMail(account.token);
-  if (!messages || messages.length === 0) {
-    await ctx.reply('📭 Писем пока нет.');
-    return;
-  }
-
-  const lastMsg = messages[0];
-  const from = lastMsg.from?.address || 'Неизвестно';
-  const subject = lastMsg.subject || '(без темы)';
-
-  await ctx.reply(
-    `✉️ *Чтобы ответить на письмо:*\n\n` +
-    `📤 Кому: \`${from}\`\n` +
-    `📌 Тема: ${subject}\n\n` +
-    `📝 *Инструкция:*\n` +
-    `1. Скопируй адрес \`${from}\`\n` +
-    `2. Открой любой почтовый клиент (Gmail, Яндекс, Mail.ru)\n` +
-    `3. Создай новое письмо и вставь адрес\n` +
-    `4. В теме напиши \`Re: ${subject}\`\n` +
-    `5. Отправь ответ\n\n` +
-    `💡 Так письмо уйдет с твоего личного ящика, а не с временного.`,
-    { parse_mode: 'Markdown' }
-  );
 });
 
 bot.command('delete', async (ctx) => {
@@ -322,7 +335,7 @@ bot.command('delete', async (ctx) => {
 
   await ctx.reply('⏳ Удаляю ящик...');
 
-  const success = await deleteMailAccount(account.token, account.address);
+  const success = await deleteMailAccount(account.email);
   if (success) {
     await db.run('DELETE FROM accounts WHERE telegram_id = ?', telegram_id);
     delete lastMessageIds[telegram_id];
@@ -345,13 +358,11 @@ bot.command('info', async (ctx) => {
   }
 
   await ctx.reply(
-    `📫 *Ваш ящик:* \`${account.address}\`\n` +
+    `📫 *Ваш ящик:* \`${account.email}\`\n` +
     `📅 Создан: ${account.created_at}\n` +
     `🔄 Последняя проверка: ${account.last_checked || 'никогда'}\n\n` +
-    `✉️ *Чтобы ответить:*\n` +
-    `/web - открыть почту в браузере\n` +
-    `/login - показать логин/пароль\n\n` +
-    `⚠️ Ящик хранится в базе данных и НЕ удаляется при перезапуске бота.`,
+    `✉️ *Чтобы отправить письмо:*\n` +
+    `/reply [email] [текст]`,
     { parse_mode: 'Markdown' }
   );
 });
@@ -362,16 +373,12 @@ bot.command('help', async (ctx) => {
     '📌 Команды:\n' +
     '/create - создать новый ящик\n' +
     '/check - проверить письма\n' +
-    '/web - открыть почту в браузере (авто-вход)\n' +
-    '/login - показать логин/пароль для входа\n' +
-    '/replyto - показать адрес отправителя для ответа\n' +
+    '/reply [email] [текст] - отправить письмо\n' +
     '/delete - удалить ящик\n' +
     '/info - информация о ящике\n' +
     '/help - помощь\n\n' +
-    '✉️ *Как ответить на письмо? (3 способа)*\n' +
-    '1️⃣ /web → открыть почту в браузере → ответить\n' +
-    '2️⃣ /replyto → скопировать email → отправить с любого ящика\n' +
-    '3️⃣ /login → войти в Mail.tm через браузер с паролем\n\n' +
+    '✉️ *Как отправить письмо:*\n' +
+    '/reply friend@gmail.com Привет! Как дела?\n\n' +
     '⚡️ *Уведомления:*\n' +
     'Я автоматически проверяю почту каждые 15 секунд и присылаю уведомления о новых письмах!\n\n' +
     '💾 *Хранение:*\n' +
@@ -388,7 +395,7 @@ async function main() {
   
   const accounts = await db.all('SELECT * FROM accounts');
   for (const acc of accounts) {
-    const messages = await checkMail(acc.token);
+    const messages = await checkMail(acc.email);
     if (messages) {
       lastMessageIds[acc.telegram_id] = messages.map(m => m.id);
     } else {
@@ -405,7 +412,7 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 
 app.get('/', (req, res) => {
-  res.send('🤖 Temp Mail Bot работает!');
+  res.send('🤖 MoeMail Bot работает!');
 });
 
 app.get('/health', (req, res) => {
