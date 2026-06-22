@@ -79,7 +79,7 @@ async function deleteMailAccount(token, address) {
   }
 }
 
-// ===== ПОЛЛИНГ ПОЧТЫ =====
+// ===== ПОЛЛИНГ ПОЧТЫ (ПРОВЕРКА КАЖДЫЕ 15 СЕКУНД) =====
 let lastMessageIds = {};
 
 async function pollAllAccounts() {
@@ -96,6 +96,7 @@ async function pollAllAccounts() {
       const from = msg.from?.address || 'Неизвестно';
       const subject = msg.subject || '(без темы)';
       const intro = msg.intro || '';
+      const messageId = msg.id;
       
       try {
         await bot.telegram.sendMessage(
@@ -104,7 +105,9 @@ async function pollAllAccounts() {
           `📤 От: ${from}\n` +
           `📌 Тема: ${subject}\n` +
           `📝 ${intro.substring(0, 200)}${intro.length > 200 ? '...' : ''}\n\n` +
-          `🔍 Чтобы прочитать полностью, нажми /check`,
+          `🔗 *Чтобы ответить, перейди по ссылке:*\n` +
+          `https://mail.tm/messages/${messageId}\n\n` +
+          `💡 Откроется веб-версия Mail.tm, там можно написать ответ прямо с твоего ящика!`,
           { parse_mode: 'Markdown' }
         );
       } catch (err) {
@@ -122,6 +125,7 @@ async function pollAllAccounts() {
   }
 }
 
+// Запускаем поллинг каждые 15 секунд
 setInterval(pollAllAccounts, 15000);
 
 // ===== КОМАНДЫ БОТА =====
@@ -133,9 +137,14 @@ bot.start(async (ctx) => {
     '📌 *Команды:*\n' +
     '/create - создать новый ящик\n' +
     '/check - проверить письма\n' +
+    '/read - показать последнее письмо и ссылку для ответа\n' +
     '/delete - удалить ящик\n' +
     '/info - информация о ящике\n' +
     '/help - помощь\n\n' +
+    '✉️ *Как ответить на письмо?*\n' +
+    '1. Напиши /read\n' +
+    '2. Бот покажет ссылку на письмо\n' +
+    '3. Перейди по ссылке и ответь в браузере\n\n' +
     '⚠️ *Важно:* Ящик сохраняется в БД и не удаляется при перезапуске бота!',
     { parse_mode: 'Markdown' }
   );
@@ -218,6 +227,41 @@ bot.command('check', async (ctx) => {
   await ctx.reply(reply, { parse_mode: 'Markdown' });
 });
 
+// ===== НОВАЯ КОМАНДА "ПРОЧИТАТЬ И ОТВЕТИТЬ" =====
+bot.command('read', async (ctx) => {
+  const telegram_id = ctx.from.id.toString();
+  
+  // Проверяем, есть ли ящик
+  const account = await db.get('SELECT * FROM accounts WHERE telegram_id = ?', telegram_id);
+  if (!account) {
+    await ctx.reply('❌ У вас нет ящика! Создайте его через /create');
+    return;
+  }
+
+  // Проверяем почту
+  const messages = await checkMail(account.token);
+  if (!messages || messages.length === 0) {
+    await ctx.reply('📭 Писем пока нет.');
+    return;
+  }
+
+  // Берем последнее письмо
+  const lastMsg = messages[0];
+  const from = lastMsg.from?.address || 'Неизвестно';
+  const subject = lastMsg.subject || '(без темы)';
+  const messageId = lastMsg.id;
+
+  await ctx.reply(
+    `📩 *Последнее письмо:*\n\n` +
+    `📤 От: ${from}\n` +
+    `📌 Тема: ${subject}\n\n` +
+    `🔗 *Чтобы ответить, перейди по ссылке:*\n` +
+    `https://mail.tm/messages/${messageId}\n\n` +
+    `💡 Откроется веб-версия Mail.tm, там можно написать ответ прямо с твоего ящика!`,
+    { parse_mode: 'Markdown' }
+  );
+});
+
 bot.command('delete', async (ctx) => {
   const telegram_id = ctx.from.id.toString();
   
@@ -266,9 +310,14 @@ bot.command('help', async (ctx) => {
     '📌 Команды:\n' +
     '/create - создать новый ящик\n' +
     '/check - проверить письма\n' +
+    '/read - показать последнее письмо и ссылку для ответа\n' +
     '/delete - удалить ящик\n' +
     '/info - информация о ящике\n' +
     '/help - помощь\n\n' +
+    '✉️ *Как ответить на письмо?*\n' +
+    '1. Напиши /read\n' +
+    '2. Бот покажет ссылку на письмо\n' +
+    '3. Перейди по ссылке и ответь в браузере\n\n' +
     '⚡️ *Уведомления:*\n' +
     'Я автоматически проверяю почту каждые 15 секунд и присылаю уведомления о новых письмах!\n\n' +
     '💾 *Хранение:*\n' +
